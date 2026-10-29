@@ -1,0 +1,9 @@
+{
+  "name": "tasteproof",
+  "version": "0.2.0",
+  "private": true,
+  "engines": {"node": ">=22.19.0"},
+  "dependencies": {
+    "@qloo/qloo-harness": "^0.1.26"
+  }
+}
