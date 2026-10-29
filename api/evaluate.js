@@ -2,66 +2,39 @@ const { execFile } = require('node:child_process');
 const path = require('node:path');
 const crypto = require('node:crypto');
 
-function clean(v, max = 160) {
-  return String(v || '').trim().replace(/[\u0000-\u001f]/g, ' ').slice(0, max);
+const TARGET_TYPES = new Set(['artist','book','brand','movie','person','place','podcast','tv_show','videogame']);
+const HARNESS_VERSION = '0.1.26';
+const HACKATHON_BASE = 'https://hackathon.api.qloo.com';
+function clean(v,max=200){return String(v||'').normalize('NFKC').trim().replace(/[\u0000-\u001f]/g,' ').slice(0,max)}
+function norm(v){return clean(v,300).toLocaleLowerCase('en-US')}
+function dedupe(values){const seen=new Set();return values.filter(v=>{const k=norm(v);if(!k||seen.has(k))return false;seen.add(k);return true})}
+function semanticEnvelope(v){if(Array.isArray(v))return v.map(semanticEnvelope);if(!v||typeof v!=='object')return v;return Object.fromEntries(Object.entries(v).filter(([k])=>!['execution','correlation_id','duration_ms'].includes(k)).map(([k,x])=>[k,semanticEnvelope(x)]))}
+function digestOf(v){return crypto.createHash('sha256').update(JSON.stringify(v)).digest('hex')}
+function runQloo(operation,input){return new Promise((resolve,reject)=>{const bin=path.join(process.cwd(),'node_modules','.bin',process.platform==='win32'?'qloo.cmd':'qloo');const env={...process.env,QLOO_BASE_URL:process.env.QLOO_BASE_URL||HACKATHON_BASE,QLOO_TRUSTED_BASE_URL:process.env.QLOO_TRUSTED_BASE_URL||HACKATHON_BASE};execFile(bin,['exec',operation,'--input',JSON.stringify(input)],{timeout:12000,env,maxBuffer:2*1024*1024,windowsHide:true},(err,stdout,stderr)=>{const text=clean(stderr||err?.message,800);if(err)return reject(Object.assign(new Error(text||`Qloo ${operation} failed`),{operation}));try{resolve(JSON.parse(stdout))}catch{reject(Object.assign(new Error(`Qloo ${operation} returned non-JSON output`),{operation}))}})})}
+function validateBody(body){const scenario=clean(body?.scenario,320),proposal=clean(body?.proposal,140),targetType=clean(body?.targetType,40).toLowerCase(),anchors=Array.isArray(body?.anchors)?dedupe(body.anchors.map(v=>clean(v,100))).slice(0,3):[];if(!scenario)return{error:'Provide the scenario being evaluated.'};if(!proposal)return{error:'Provide the AI recommendation being audited.'};if(!TARGET_TYPES.has(targetType))return{error:'Choose a supported Qloo target type.'};if(!anchors.length)return{error:'Provide 1-3 explicit cultural anchors.'};return{scenario,proposal,targetType,anchors}}
+function findProposalResult(rank,proposal){const options=rank?.interpretation?.options||[],resolved=options.find(o=>norm(o.input)===norm(proposal)),results=Array.isArray(rank?.results)?rank.results:[];if(!resolved)return{resolved:null,result:null,rank:null};const index=results.findIndex(r=>(resolved.entityId&&r?.entity_id===resolved.entityId)||(resolved.name&&norm(r?.name)===norm(resolved.name)));return{resolved,result:index>=0?results[index]:null,rank:index>=0?index+1:null}}
+function classify(rankPosition,resultCount){if(!rankPosition||resultCount<2)return'uncertain';return rankPosition===1?'supported':'weak'}
+function evidenceStatus(envelope){return['ok','partial'].includes(envelope?.status)}
+
+async function handler(req,res){
+ res.setHeader('Cache-Control','no-store');
+ if(req.method!=='POST')return res.status(405).json({error:'POST only'});
+ const validated=validateBody(req.body);
+ if(validated.error)return res.status(400).json({status:'invalid_input',error:validated.error,fallbackUsed:false});
+ const{scenario,proposal,targetType,anchors}=validated;
+ if(!process.env.QLOO_API_KEY)return res.status(503).json({status:'configuration_required',mode:'live_qloo',fallbackUsed:false,message:'Live Qloo credential is not configured. TasteProof fails closed and never substitutes fixture evidence.'});
+ const startedAt=new Date().toISOString();
+ try{
+  const recommendation=await runQloo('recommend',{target_type:targetType,signals:anchors,explain:true,limit:5});
+  if(!evidenceStatus(recommendation)){const semantic={input:{scenario,proposal,targetType,anchors},recommendation:semanticEnvelope(recommendation)},digest=digestOf(semantic);return res.status(422).json({status:'qloo_needs_input',mode:'live_qloo',fallbackUsed:false,message:recommendation?.summary||'Qloo could not resolve enough input to produce grounded candidates.',passport:{culturalFit:'uncertain',proposal,proposalRank:null,testedCandidates:0,betterGroundedAlternative:null},provenance:{source:'Qloo',workflows:['recommend'],harness:HARNESS_VERSION},evidence:{recommendation},runDigest:`sha256:${digest}`})}
+  const groundedNames=(Array.isArray(recommendation.results)?recommendation.results:[]).map(x=>clean(x?.name,140)).filter(Boolean),options=dedupe([proposal,...groundedNames]).slice(0,6);
+  if(options.length<2){const semantic={input:{scenario,proposal,targetType,anchors},recommendation:semanticEnvelope(recommendation)},digest=digestOf(semantic);return res.status(200).json({status:'insufficient_qloo_evidence',mode:'live_qloo',fallbackUsed:false,passport:{culturalFit:'uncertain',proposal,proposalRank:null,testedCandidates:options.length,betterGroundedAlternative:null,why:'Qloo returned too little candidate evidence for a meaningful relative test.'},provenance:{source:'Qloo',workflows:['recommend'],harness:HARNESS_VERSION,live:true},limitations:['No relative cultural-fit conclusion is made from a one-option test.'],evidence:{recommendation},runDigest:`sha256:${digest}`,startedAt,completedAt:new Date().toISOString()})}
+  const ranking=await runQloo('rank',{options,option_type:targetType,signals:anchors});
+  if(!evidenceStatus(ranking)){const semantic={input:{scenario,proposal,targetType,anchors},recommendation:semanticEnvelope(recommendation),ranking:semanticEnvelope(ranking)},digest=digestOf(semantic);return res.status(422).json({status:'qloo_needs_input',mode:'live_qloo',fallbackUsed:false,message:ranking?.summary||'Qloo could not resolve the proposal or comparison set for ranking.',passport:{culturalFit:'uncertain',proposal,proposalRank:null,testedCandidates:options.length,betterGroundedAlternative:null},provenance:{source:'Qloo',workflows:['recommend','rank'],harness:HARNESS_VERSION},evidence:{recommendation,ranking},runDigest:`sha256:${digest}`})}
+  const results=Array.isArray(ranking.results)?ranking.results:[],proposalEvidence=findProposalResult(ranking,proposal),culturalFit=classify(proposalEvidence.rank,results.length),top=results[0]||null,topIsProposal=proposalEvidence.result&&top&&proposalEvidence.result.entity_id===top.entity_id,alternative=!topIsProposal&&top?{entityId:top.entity_id||null,name:top.name||null,affinity:top.affinity??null}:null,why=culturalFit==='supported'?`The audited proposal ranked #1 among ${results.length} options tested together against the same explicit anchors.`:culturalFit==='weak'?`The audited proposal ranked #${proposalEvidence.rank} of ${results.length}; at least one Qloo-grounded candidate ranked higher in the same comparison.`:'Qloo did not establish a reliable relative rank for the audited proposal.';
+  const semantic={input:{scenario,proposal,targetType,anchors},recommendation:semanticEnvelope(recommendation),ranking:semanticEnvelope(ranking)},digest=digestOf(semantic);
+  return res.status(200).json({status:'ok',mode:'live_qloo',fallbackUsed:false,passport:{scenario,anchors,targetType,proposal,culturalFit,proposalRank:proposalEvidence.rank,testedCandidates:results.length,betterGroundedAlternative:alternative,why},provenance:{source:'Qloo API via @qloo/qloo-harness',workflows:['recommend','rank'],harness:HARNESS_VERSION,baseUrl:HACKATHON_BASE,live:true},boundaries:{maxAnchors:3,maxComparedOptions:6,timeoutMsPerWorkflow:12000,fallback:'none'},limitations:['This is a relative test against the options evaluated in this run, not a universal cultural truth.','Qloo evidence describes aggregate taste patterns and must not be treated as a prediction about an individual.','Ambiguous or unresolved entities remain visible rather than being silently replaced.'],evidence:{recommendation,ranking},runId:`tp_${digest.slice(0,16)}`,runDigest:`sha256:${digest}`,startedAt,completedAt:new Date().toISOString()});
+ }catch(error){return res.status(502).json({status:'qloo_failed_closed',mode:'live_qloo',fallbackUsed:false,failedOperation:error.operation||null,message:clean(error.message,800)||'Qloo workflow failed.',boundaries:{fallback:'none'}})}
 }
-
-function runQloo(args) {
-  return new Promise((resolve, reject) => {
-    const bin = path.join(process.cwd(), 'node_modules', '.bin', process.platform === 'win32' ? 'qloo.cmd' : 'qloo');
-    execFile(bin, args, { timeout: 8000, env: process.env, maxBuffer: 1024 * 1024 }, (err, stdout, stderr) => {
-      if (err) return reject(new Error(clean(stderr || err.message, 600)));
-      try { resolve(JSON.parse(stdout)); }
-      catch { reject(new Error('Qloo returned non-JSON output')); }
-    });
-  });
-}
-
-module.exports = async (req, res) => {
-  res.setHeader('Cache-Control', 'no-store');
-  if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' });
-
-  if (!process.env.QLOO_API_KEY) {
-    return res.status(503).json({
-      status: 'configuration_required',
-      mode: 'live_qloo',
-      message: 'Live Qloo credential is not configured. TasteProof fails closed and will not substitute fixture evidence.'
-    });
-  }
-
-  const goal = clean(req.body?.goal, 240);
-  const seeds = Array.isArray(req.body?.seeds)
-    ? req.body.seeds.map(v => clean(v, 80)).filter(Boolean).slice(0, 3)
-    : [];
-
-  if (!goal || !seeds.length) return res.status(400).json({ error: 'Provide a goal and 1-3 explicit cultural seeds.' });
-
-  const startedAt = new Date().toISOString();
-  const evidence = [];
-  try {
-    for (const seed of seeds) {
-      const result = await runQloo(['api', 'search', '--query', seed, '--take', '5', '--json']);
-      evidence.push({ seed, result });
-    }
-    const normalized = { goal, seeds, evidence };
-    const digest = crypto.createHash('sha256').update(JSON.stringify(normalized)).digest('hex');
-    return res.status(200).json({
-      status: 'ok',
-      mode: 'live_qloo',
-      source: 'Qloo API via @qloo/qloo-harness',
-      startedAt,
-      completedAt: new Date().toISOString(),
-      boundaries: { maxSeeds: 3, timeoutMsPerSeed: 8000, fallback: 'none' },
-      evidence,
-      runDigest: `sha256:${digest}`,
-      interpretationNote: 'Qloo results describe aggregate cultural affinities. TasteProof does not treat them as claims about an individual.'
-    });
-  } catch (error) {
-    return res.status(502).json({
-      status: 'qloo_failed_closed',
-      mode: 'live_qloo',
-      message: clean(error.message, 600),
-      fallbackUsed: false
-    });
-  }
-};
+module.exports=handler;
+module.exports._test={validateBody,findProposalResult,classify,semanticEnvelope,digestOf};

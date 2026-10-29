@@ -1,9 +1,8 @@
-{
+﻿{
   "name": "tasteproof",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "engines": {"node": ">=22.19.0"},
-  "dependencies": {
-    "@qloo/qloo-harness": "^0.1.26"
-  }
+  "scripts": {"test": "node --test"},
+  "dependencies": {"@qloo/qloo-harness": "0.1.26"}
 }
