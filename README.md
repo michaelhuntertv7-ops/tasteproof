@@ -45,6 +45,7 @@ Scores from separate ranking calls are not treated as comparable. The proposal a
 - No provider fallback; live Qloo failure fails closed.
 - Fixture results are visibly synthetic and never represented as Qloo output.
 - Ambiguous or unresolved entities remain visible.
+- Curated judge presets pin previously verified Qloo entity UUIDs behind their human-readable labels to avoid name collisions; any field the user edits immediately drops its pin and returns to Qloo-native resolution.
 - Qloo aggregate affinities are not claims about one individual's identity or future behavior.
 
 ## Local setup
