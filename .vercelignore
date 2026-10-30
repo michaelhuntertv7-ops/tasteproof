@@ -1,0 +1,7 @@
+journal/
+finalist-kit/
+install-qloo-key-watch.ps1
+qloo-key-watch*.ps1
+qloo-key-watch*.json
+scheduler-evidence.log
+.env*
